@@ -1,0 +1,197 @@
+<?php
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_unifaun_menu() {
+  $items['admin/commerce/deliveries/unifaun'] = array(
+    'title' => 'Export to Unifaun',
+    'description' => 'Export XML for Unifaun orders.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('commerce_unifaun_confirm_form'),
+    'access arguments' => array('commerce_unifaun'),
+    'weight' => 10,
+    'type' => MENU_LOCAL_TASK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function commerce_unifaun_permission() {
+  return array(
+    'commerce_unifaun' => array(
+      'title' => t('Export unifaun'),
+      'description' => t('Unifaun'),
+      'restrict access' => TRUE,
+    )
+  );
+}
+
+/**
+ * The form that initiates the export.
+ */
+function commerce_unifaun_confirm_form($form, &$form_state) {
+  // Statues option.
+  $form['status'] = array(
+    '#type' => 'checkboxes',
+    '#title' => t('Deliveries to export'),
+    '#options' => commerce_delivery_get_status(),
+    '#default_value' => array('0'),
+    '#required' => TRUE,
+  );
+  $form['new_status'] = array(
+    '#type' => 'select',
+    '#title' => t('Change the status of exported deliveries to'),
+    '#options' => array(
+      '-1' => "- Don't change -",
+    ) + commerce_delivery_get_status(),
+    '#default_value' => '1',
+  );
+
+  // Submit button.
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Export'),
+  );
+
+  return $form;
+}
+
+/**
+ * Form submitter.
+ *
+ * Performs the actual export, and transfers an XML file to the user.
+ */
+function commerce_unifaun_confirm_form_submit($form, &$form_state) {
+  // Filter out the statuses that has been set.
+  $statuses = array_filter($form_state['values']['status'], function($value) {
+    return is_string($value);
+  });
+
+  // Create and execute a query that fetches the deliveries based on the
+  // statuses.
+  $query = new EntityFieldQuery();
+  $query->entityCondition('entity_type', 'commerce_delivery')
+    ->propertyCondition('status', $statuses)
+    ->fieldCondition('field_delivery_products', 'value', 0, '>');
+  $result = $query->execute();
+
+  // Bail out if we didn't find any deliveries.
+  if (!isset($result['commerce_delivery']) || empty($result['commerce_delivery'])) {
+    drupal_set_message(t("Couldn't find any deliveries to export."), 'error');
+    return;
+  }
+
+  foreach ($result['commerce_delivery'] as $commerce_delivery) {
+    // Load the full delivery.
+    $commerce_delivery = commerce_delivery_load($commerce_delivery->delivery_id);
+
+    // Load the order, and customer details.
+    $commerce_order = commerce_order_load($commerce_delivery->order_id);
+    $commerce_customer_shipping = field_get_items('commerce_order', $commerce_order, 'commerce_customer_shipping');
+    $commerce_customer_shipping = commerce_customer_profile_load($commerce_customer_shipping[0]['profile_id']);
+    $commerce_customer_address = current(field_get_items('commerce_customer_profile', $commerce_customer_shipping, 'commerce_customer_address'));
+    $commerce_customer_shipping_cell = field_get_items('commerce_customer_profile', $commerce_customer_shipping, 'field_customer_shipping_cell');
+    $commerce_customer_shipping_cell = is_array($commerce_customer_shipping_cell) ? $commerce_customer_shipping_cell[0]['value'] : FALSE;
+    $user = user_load($commerce_customer_shipping->uid);
+
+    // Add the customer profile to the customer array.
+    $customers[$commerce_customer_shipping->profile_id] = array(
+      'name' => $commerce_customer_address['name_line'],
+      'address1' => $commerce_customer_address['thoroughfare'],
+      'address2' => $commerce_customer_address['premise'],
+      'zipcode' => str_replace(' ', '', $commerce_customer_address['postal_code']),
+      'city' => $commerce_customer_address['locality'],
+      'country' => $commerce_customer_address['country'],
+      'email' => $user->mail,
+    );
+    // Add the cell phone if the customer has entered one.
+    if ($commerce_customer_shipping_cell) {
+      $customers[$commerce_customer_shipping->profile_id]['phone'] = $commerce_customer_shipping_cell;
+      $customers[$commerce_customer_shipping->profile_id]['sms'] = $commerce_customer_shipping_cell;
+    }
+
+    // Add this delivery to the shipments array.
+    $shipments[$commerce_delivery->delivery_id] = array(
+      'from' => $commerce_order->status == 'send_from_jetpak' ? 2 : 1,
+      'to' => $commerce_customer_shipping->profile_id,
+      'reference' => $commerce_order->order_id,
+      'returnto' => $commerce_order->status == 'send_from_jetpak' ? 2 : 1,
+    );
+    // Add the container.
+    $containers[$commerce_delivery->delivery_id] = array(
+      array(
+        'weight' => 0.5,
+        'copies' => 1,
+      )
+    );
+    // Add the service.
+    $services[$commerce_delivery->delivery_id]['ASPO'] = array();
+    if ($commerce_customer_shipping_cell) {
+      $services[$commerce_delivery->delivery_id]['ASPO']['NOT'] = array(
+        'misc' => $commerce_customer_shipping_cell,
+        'misctype' => 'SMS',
+      );
+    }
+
+    // Change the status of this delivery, if wanted.
+    if ($form_state['values']['new_status'] != -1) {
+      $commerce_delivery->status = $form_state['values']['new_status'];
+      commerce_delivery_save($commerce_delivery);
+    }
+  }
+
+  // Create the output.
+  $output = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+  $output .= "<data>\n";
+  // Customers.
+  foreach ($customers as $customer_id => $customer_data) {
+    $output .= "\t<receiver rcvid=\"$customer_id\">\n";
+    foreach ($customer_data as $key => $value) {
+      $value = htmlspecialchars($value, ENT_QUOTES | ENT_HTML5);
+      $output .= "\t\t<val n=\"$key\">$value</val>\n";
+    }
+    $output .= "\t</receiver>\n";
+  }
+  // Shipments.
+  foreach ($shipments as $shipment_id => $shipment_data) {
+    $output .= "\t<shipment orderno=\"$shipment_id\">\n";
+    foreach ($shipment_data as $key => $value) {
+      $value = htmlspecialchars($value, ENT_QUOTES | ENT_HTML5);
+      $output .= "\t\t<val n=\"$key\">$value</val>\n";
+    }
+    // The shipment service.
+    foreach ($services[$shipment_id] as $srvid => $service_data) {
+      $output .= "\t\t<service srvid=\"$srvid\">\n";
+        foreach ($service_data as $addon => $values) {
+          $output .= "\t\t\t<addon adnid=\"$addon\">\n";
+          foreach ($values as $key => $value) {
+            $value = htmlspecialchars($value, ENT_QUOTES | ENT_HTML5);
+            $output .= "\t\t\t\t<val n=\"$key\">" . $value . "</val>\n";
+          }
+          $output .= "\t\t\t</addon>\n";
+        }
+      $output .= "\t\t</service>\n";
+    }
+    // The containers for this shipment.
+    foreach ($containers[$shipment_id] as $container_data) {
+      $output .= "\t\t<container type=\"parcel\">\n";
+      foreach ($container_data as $key => $value) {
+        $value = htmlspecialchars($value, ENT_QUOTES);
+        $output .= "\t\t\t<val n=\"$key\">$value</val>\n";
+      }
+      $output .= "\t\t</container>\n";
+    }
+    $output .= "\t</shipment>\n";
+  }
+  $output .= "</data>";
+
+  // Transfer the file to the user.
+  header('Content-type: text/xml');
+  header('Content-Disposition: attachment; filename="Unifaun export ' . date('Y-m-d H:i') . '.xml"');
+  print $output;
+  die();
+}
